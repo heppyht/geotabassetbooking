@@ -43,7 +43,7 @@ test("no company domains in active deployment config or docs", () => {
 
 test("wrangler.toml: personal-testing values", () => {
   assert.equal(tomlVar("name"), "opex-vbm-api");
-  assert.equal(tomlVar("ALLOWED_ORIGIN"), "https://heppyh.github.io");
+  assert.equal(tomlVar("ALLOWED_ORIGIN"), "https://heppyht.github.io");
   assert.equal(tomlVar("GEOTAB_DATABASE"), "opex_trial");
   assert.notEqual(tomlVar("APP_ENV"), "development", "deployed default must not expose error messages");
   assert.match(activeToml, /^workers_dev\s*=\s*true/m);
@@ -80,7 +80,7 @@ test("environment examples contain placeholders only and keep identity off", () 
 
 test("Add-In config: valid JSON, personal host, tenant untouched", () => {
   const cfg = JSON.parse(read("geotab/opex-vbm-config.json"));
-  assert.equal(new URL(cfg.items[0].url).host, "heppyh.github.io");
+  assert.equal(new URL(cfg.items[0].url).host, "heppyht.github.io");
   // Approved support email is heppy@opexcg.com; reject all other opex-containing emails.
   assert.doesNotMatch(cfg.supportEmail.replace("heppy@opexcg.com", ""), /opex/i);
 });
@@ -102,13 +102,13 @@ test("CORS preflight from the GitHub Pages origin is allowed with the Geotab hea
   const res = await app.request("/api/bookings", {
     method: "OPTIONS",
     headers: {
-      Origin: "https://heppyh.github.io",
+      Origin: "https://heppyht.github.io",
       "Access-Control-Request-Method": "POST",
       "Access-Control-Request-Headers": "content-type,idempotency-key,x-geotab-session-id,x-geotab-user-name",
     },
   }, env);
   assert.ok(res.status === 200 || res.status === 204, `status ${res.status}`);
-  assert.equal(res.headers.get("access-control-allow-origin"), "https://heppyh.github.io");
+  assert.equal(res.headers.get("access-control-allow-origin"), "https://heppyht.github.io");
   const allowed = (res.headers.get("access-control-allow-headers") || "").toLowerCase();
   for (const h of ["content-type", "authorization", "idempotency-key", "x-geotab-session-id", "x-geotab-user-name"]) {
     assert.ok(allowed.includes(h), `missing allow-header ${h}`);
@@ -116,7 +116,7 @@ test("CORS preflight from the GitHub Pages origin is allowed with the Geotab hea
 });
 
 test("other origins are rejected, including the full Pages URL with a path", async () => {
-  for (const origin of ["https://example.com", "https://heppyh.github.io/opexassetbooking", "http://heppyh.github.io"]) {
+  for (const origin of ["https://example.com", "https://heppyht.github.io/geotabassetbooking", "http://heppyht.github.io"]) {
     const res = await app.request("/api/health", { headers: { Origin: origin } }, env);
     assert.equal(res.status, 403, origin);
     assert.deepEqual(await res.json(), { error: "ORIGIN_NOT_ALLOWED" });
@@ -124,7 +124,7 @@ test("other origins are rejected, including the full Pages URL with a path", asy
 });
 
 test("health reports tenant opex_trial and identity disabled", async () => {
-  const res = await app.request("/api/health", { headers: { Origin: "https://heppyh.github.io" } }, env);
+  const res = await app.request("/api/health", { headers: { Origin: "https://heppyht.github.io" } }, env);
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.ok, true);
@@ -137,7 +137,7 @@ test("protected routes fail closed (503) while identity is not configured, even 
     const res = await app.request(url, {
       method,
       headers: {
-        Origin: "https://heppyh.github.io",
+        Origin: "https://heppyht.github.io",
         "x-geotab-session-id": "not-a-real-session",
         "x-geotab-user-name": "someone@example.com",
         "content-type": "application/json",

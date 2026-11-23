@@ -5,7 +5,7 @@
   "items": [
     {
       "serviceName": "OPEX Notification Service",
-      "serviceSrc": "https://heppyh.github.io/opexassetbooking/serviceAddin.js"
+      "serviceSrc": "https://heppyht.github.io/geotabassetbooking/serviceAddin.js"
     }
   ]
 }
