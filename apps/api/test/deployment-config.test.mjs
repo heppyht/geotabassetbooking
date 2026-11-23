@@ -80,7 +80,7 @@ test("environment examples contain placeholders only and keep identity off", () 
 
 test("Add-In config: valid JSON, personal host, tenant untouched", () => {
   const cfg = JSON.parse(read("geotab/opex-vbm-config.json"));
-  assert.equal(new URL(cfg.items[0].url).host, "heppyht.github.io");
+  assert.equal(new URL(cfg.items[0].url).host, "heppyh.github.io");
   // Approved support email is heppy@opexcg.com; reject all other opex-containing emails.
   assert.doesNotMatch(cfg.supportEmail.replace("heppy@opexcg.com", ""), /opex/i);
 });
@@ -116,7 +116,7 @@ test("CORS preflight from the GitHub Pages origin is allowed with the Geotab hea
 });
 
 test("other origins are rejected, including the full Pages URL with a path", async () => {
-  for (const origin of ["https://example.com", "https://heppyh.github.io/geotabassetbooking", "http://heppyh.github.io"]) {
+  for (const origin of ["https://example.com", "https://heppyh.github.io/opexassetbooking", "http://heppyh.github.io"]) {
     const res = await app.request("/api/health", { headers: { Origin: origin } }, env);
     assert.equal(res.status, 403, origin);
     assert.deepEqual(await res.json(), { error: "ORIGIN_NOT_ALLOWED" });
