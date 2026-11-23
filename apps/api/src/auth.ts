@@ -1,61 +1,50 @@
+/*───────────────────── MyGeotab Session Auth (no SQL) ─────────────────────*/
+/* Replaces the PostgreSQL-backed identity mapping layer. Principal resolution
+   now verifies the MyGeotab session via the REST API and derives the principal
+   from the verified user. No identity_mappings, no role_assignments tables.
+   All authenticated users default to EMPLOYEE role. Elevated roles
+   (APPROVER, GA, MANAGEMENT, ADMIN) are resolved from the verified MyGeotab
+   user record's `role` field and require administrator-managed configuration
+   in MyGeotab. There is no application-side role store.
+   DRIVER is an application-level role determined by data relationship
+   (assignedDriverUserId on bookings), not assigned at authentication time.
+   No postgres, no external database. */
+
 import type { MiddlewareHandler } from "hono";
 import type { Env } from "./env.ts";
-import type { Sql } from "postgres";
-import { sqlFor } from "./db.ts";
-import type { GeotabCredentials } from "./integrations/mygeotab/types.ts";
-import { TenantValidatedMyGeotabAdapter } from "./integrations/mygeotab/adapter.ts";
+import { createGateway, type GeotabCredentials } from "./db.ts";
+import type { GeotabSessionVerification } from "./integrations/mygeotab/types.ts";
 
-export type AppRole = "EMPLOYEE" | "APPROVER" | "GA" | "MANAGEMENT" | "ADMIN";
+export type AppRole = "EMPLOYEE" | "APPROVER" | "GA" | "MANAGEMENT" | "ADMIN" | "DRIVER";
 export type Principal = { appUserId: string; geotabUserId: string; roles: AppRole[]; siteIds: string[] };
 
 declare module "hono" {
   interface ContextVariableMap { principal: Principal }
 }
 
-/**
- * Header names used to transport MyGeotab session credentials from the
- * Add-In frontend to the backend. The frontend receives an already-authenticated
- * `api` object from the MyGeotab host in `initialize(api, state, callback)` and
- * extracts the session credentials (userName, database, sessionId) from it.
- *
- * The database name is NEVER accepted from the frontend as proof of tenant
- * membership. It is always validated against `env.GEOTAB_DATABASE` (`opex_trial`).
- */
 const HEADER_SESSION_ID = "x-geotab-session-id";
 const HEADER_USER_NAME = "x-geotab-user-name";
 
-/**
- * Extract MyGeotab session credentials from an HTTP request.
- * Returns null when no credentials are present.
- */
+/* MyGeotab user role -> AppRole mapping. Only known roles are mapped;
+   anything else defaults to EMPLOYEE (fail closed, no elevation). */
+const MYGEOTAB_ROLE_MAP: Record<string, AppRole> = {
+  EMPLOYEE: "EMPLOYEE",
+  APPROVER: "APPROVER",
+  GA: "GA",
+  MANAGEMENT: "MANAGEMENT",
+  ADMIN: "ADMIN",
+};
+
 export function extractGeotabCredentials(request: Request): GeotabCredentials | null {
   const sessionId = request.headers.get(HEADER_SESSION_ID) ?? request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   const userName = request.headers.get(HEADER_USER_NAME);
+  const database = request.headers.get("x-geotab-database") ?? "";
 
   if (!sessionId || !userName) return null;
 
-  return { userName, database: "", sessionId };
+  return { userName, database, sessionId };
 }
 
-/**
- * SECURITY GATE:
- * Resolves a verified principal from a MyGeotab session.
- *
- * Flow:
- * 1. Extract session credentials (sessionId + userName) from the request.
- * 2. Fail closed if `IDENTITY_ADAPTER_CONFIGURED !== "true"`.
- * 3. Verify the session by calling MyGeotab API with the user's sessionId
- *    (sessionId substitutes for the password per MyGeotab SDK docs).
- * 4. Validate that the session's database equals `env.GEOTAB_DATABASE`
- *    (`opex_trial`). The frontend-supplied database is never trusted.
- * 5. Look up `identity_mappings` for the geotab_user_id + database_name.
- * 6. Look up `role_assignments` for the mapped app_user.
- * 7. Return the Principal or null on any failure.
- *
- * If the MyGeotab adapter is not implemented (throws
- * GEOTAB_ADAPTER_NOT_IMPLEMENTED), verification fails and this returns null.
- * Protected endpoints remain fail-closed until the adapter is implemented.
- */
 export async function resolveVerifiedPrincipal(
   request: Request,
   env: Env,
@@ -66,60 +55,32 @@ export async function resolveVerifiedPrincipal(
   const credentials = extractGeotabCredentials(request);
   if (!credentials) return null;
 
-  // Step 3: Verify the MyGeotab session server-side.
-  const adapter = new TenantValidatedMyGeotabAdapter({
-    database: env.GEOTAB_DATABASE,
-    server: undefined,
-  });
+  /* Tenant isolation: never accept a client-supplied database override.
+     The gateway always uses the server-configured GEOTAB_DATABASE. */
+  const database = env.GEOTAB_DATABASE;
+  const gateway = createGateway({ userName: credentials.userName, database, sessionId: credentials.sessionId });
 
-  let verification;
+  let verification: { valid: boolean; database: string; userName: string; role?: string };
   try {
-    verification = await adapter.verifySession({
-      ...credentials,
-      database: env.GEOTAB_DATABASE, // Always use server-configured tenant, never frontend-supplied.
-    });
+    verification = await gateway.verifySession({ userName: credentials.userName, database, sessionId: credentials.sessionId });
   } catch {
-    // Session invalid, expired, or adapter not implemented.
     return null;
   }
 
   if (!verification?.valid) return null;
-
-  // Step 4: Tenant isolation — the verified database must match opex_trial.
   if (verification.database !== env.GEOTAB_DATABASE) return null;
 
-  // Step 5 & 6: Map MyGeotab identity to application user and roles.
-  const sql = sqlFor(env);
-  try {
-    const mappings = await sql`
-      select im.app_user_id, im.geotab_user_id, im.database_name, im.is_active
-      from identity_mappings im
-      where im.geotab_user_id = ${verification.userName}
-        and im.database_name = ${env.GEOTAB_DATABASE}
-        and im.is_active = true
-      limit 1
-    `;
-    if (!mappings.length) return null;
+  /* Resolve role from the verified MyGeotab user record. Fail closed to
+     EMPLOYEE when the role is unknown or absent — never elevate silently. */
+  const resolvedRole = verification.role ? MYGEOTAB_ROLE_MAP[verification.role] : undefined;
+  const roles = resolvedRole ? [resolvedRole] : (["EMPLOYEE"] as AppRole[]);
 
-    const appUserId = mappings[0].app_user_id;
-
-    const rolesRows = await sql`
-      select role from role_assignments
-      where user_id = ${appUserId}
-    `;
-    const roles = rolesRows.map(r => r.role as AppRole);
-
-    if (roles.length === 0) return null;
-
-    return {
-      appUserId,
-      geotabUserId: verification.userName,
-      roles,
-      siteIds: [],
-    };
-  } finally {
-    await sql.end();
-  }
+  return {
+    appUserId: verification.userName,
+    geotabUserId: verification.userName,
+    roles,
+    siteIds: [],
+  };
 }
 
 export const requirePrincipal: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {

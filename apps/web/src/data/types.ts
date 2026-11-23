@@ -205,6 +205,105 @@ export interface OpexBookingAudit {
   created_at: string;
 }
 
+/*───────────────────── AddInData Record Schemas (schemaVersion 2) ─────────────────────*/
+
+export type AddInDataRecordType = "booking" | "booking_audit" | "notification";
+
+export interface AddInDataRecordEnvelope<T> {
+  recordType: AddInDataRecordType;
+  schemaVersion: number;
+  entityId?: string;          // AddInData server record id (record.id from Add API response)
+  data: T;
+}
+
+/* Booking Master record — one AddInData record per booking. */
+export interface AddInDataBookingData {
+  bookingId: string;          // application-level booking id (distinct from AddInData entityId)
+  status: OpexBooking["status"];
+  vehicle: {
+    deviceId: string;
+    name: string | null;
+  };
+  driver?: {
+    driverId: string;
+    name: string | null;
+  };
+  schedule: {
+    startAtUtc: string;
+    endAtUtc: string;
+  };
+  destination: string | null;
+  purpose: string;
+  lifecycle: {
+    createdAtUtc: string;
+    updatedAtUtc: string;
+  };
+  version: number;
+}
+
+/* Booking Audit History record — one AddInData record per audit event (append-only). */
+export interface AddInDataAuditData {
+  eventId: string;
+  bookingId: string;
+  eventType: AuditAction;
+  occurredAtUtc: string;
+  actor: {
+    userId: string;
+    name: string | null;
+  };
+  changes: Array<{
+    field: string;
+    previousValue: unknown;
+    newValue: unknown;
+  }>;
+  metadata: {
+    source: "MYGEOTAB_ADDIN";
+    idempotencyKey: string;
+  };
+}
+
+/* Partition key for bounded AddInData queries. Format: YYYY-MM */
+export type PeriodKey = string;
+
+export function makePeriodKey(isoUtc: string): PeriodKey {
+  const d = new Date(isoUtc);
+  if (Number.isNaN(d.getTime())) return "unknown";
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+/* Booking status transitions — shared between frontend and API. */
+export type AuditAction =
+  | "BOOKING_CREATED"
+  | "BOOKING_UPDATED"
+  | "BOOKING_SUBMITTED"
+  | "BOOKING_APPROVED"
+  | "BOOKING_REJECTED"
+  | "BOOKING_CANCELLED"
+  | "BOOKING_COMPLETED"
+  | "BOOKING_RESCHEDULED";
+
+export const BOOKING_VALID_TRANSITIONS: Record<string, string[]> = {
+  DRAFT: ["SUBMITTED", "CANCELLED"],
+  SUBMITTED: ["PENDING_APPROVAL", "APPROVED", "REJECTED", "CANCELLED"],
+  PENDING_APPROVAL: ["APPROVED", "REJECTED", "CANCELLED"],
+  APPROVED: ["ASSIGNED", "CANCELLED"],
+  ASSIGNED: ["CHECKED_OUT", "CANCELLED"],
+  CHECKED_OUT: ["OVERDUE", "RETURNED"],
+  OVERDUE: ["RETURNED"],
+  RETURNED: ["CLOSED"],
+  REJECTED: [],
+  CANCELLED: [],
+  CLOSED: [],
+  EXPIRED: [],
+  COMPLETED: [],
+} as const;
+
+export function isValidBookingTransition(from: string, to: string): boolean {
+  return BOOKING_VALID_TRANSITIONS[from]?.includes(to) ?? false;
+}
+
 /*───────────────────── Notification Provider Interface ─────────────────────*/
 
 export interface NotificationDataProvider {

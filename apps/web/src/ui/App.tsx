@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { bookingDataProvider } from "../data/dataProvider";
 import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider, OpexNotification, NotificationType, NotificationDataProvider } from "../data/types";
 import { createAddInDataProvider } from "../data/addinDataProvider";
+import { createBookingServiceProvider } from "../data/bookingServiceProvider";
 import { createNotificationEngine } from "../data/notificationService";
 import { useAutoRefresh } from "./autoRefresh";
 import { formatStatusLabel, statusClassKey } from "./statusHelpers";
@@ -1937,9 +1938,9 @@ export default function App() {
       let mounted = true;
 
       const effectiveMode = isKnownMode(mode) ? mode : "DEMO";
-      const dataProvider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
-        ? createAddInDataProvider(geotabApi, addInId)
-        : bookingDataProvider;
+const dataProvider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
+  ? createBookingServiceProvider(geotabApi, addInId)
+  : bookingDataProvider;
 
       const loadMasterData = async () => {
         try {
@@ -2014,7 +2015,7 @@ export default function App() {
   const provider = useMemo(() => {
     // Fail closed: only explicit DEMO uses local demo provider; only explicit ADDIN_DATA uses live provider.
     if (mode === "ADDIN_DATA") {
-      return createAddInDataProvider(geotabApi, addInId);
+      return createBookingServiceProvider(geotabApi, addInId);
     }
     if (mode === "DEMO") {
       return bookingDataProvider;

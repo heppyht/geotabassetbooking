@@ -15,7 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  build-production:
+    environment: production
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -33,12 +34,13 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Build web
+      - name: Build web (production)
         run: npm --workspace apps/web run build
         env:
           VITE_GEOTAB_DATABASE: opex_trial
-          # Public, non-secret. Set as a repository VARIABLE (not a secret) once the
-          # Worker exists: https://opex-vbm-api.<account-subdomain>.workers.dev
+          # Public, non-secret. Production Worker URL:
+          # https://opex-vbm-api.<account-subdomain>.workers.dev
+          # Set as a repository VARIABLE (not a secret) once the Worker exists.
           # When unset the UI shows "Backend not connected".
           VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
 
@@ -54,13 +56,13 @@ jobs:
         with:
           path: apps/web/dist
 
-  deploy:
+  deploy-production:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    needs: build
+    needs: build-production
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy to GitHub Pages (production)
         id: deployment
         uses: actions/deploy-pages@v4

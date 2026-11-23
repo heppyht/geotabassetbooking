@@ -25,17 +25,29 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: TypeScript validation
+      - name: API TypeScript validation
+        run: npm --workspace apps/api run typecheck
+
+      - name: API tests
+        run: npm --workspace apps/api run test
+
+      - name: Web TypeScript validation
         run: npx tsc -p apps/web/tsconfig.json --noEmit
 
-      - name: Application tests
-        run: npm test
-
-      - name: Web regression tests
+      - name: Web tests
         run: npm --workspace apps/web run test
 
-      - name: Service Add-In tests
-        run: node --experimental-strip-types apps/web/test/service-addin.test.mjs
-
-      - name: Production build
+      - name: Web production build
         run: npm --workspace apps/web run build
+        env:
+          VITE_GEOTAB_DATABASE: opex_trial
+
+      - name: Deployment configuration validation
+        run: node --experimental-strip-types apps/api/test/deployment-config.test.mjs
+
+      - name: Upload web build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: apps/web/dist
+          retention-days: 7

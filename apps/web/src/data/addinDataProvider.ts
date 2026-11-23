@@ -1,23 +1,48 @@
-/*───────────────────── MyGeotab AddInData Booking Provider ─────────────────────*/
+/*───────────────────── MyGeotab AddInData Booking Provider (schema v2) ─────────────────────*/
 /* Booking transactions stored in MyGeotab AddInData.
-   One AddInData record per booking. details = JSON-compatible object (max 10,000 serialized chars).
+   One AddInData record per booking (current state only).
+   One AddInData record per audit event (append-only).
    Master data (devices/users/groups) loaded live from MyGeotab Get calls.
-   No localStorage, no external database, no PostgreSQL/Neon/Cloudflare. */
+   No localStorage, no external database, no PostgreSQL/Neon/Cloudflare.
+
+   Record design:
+     - booking:    recordType="booking", schemaVersion=2, periodKey=YYYY-MM
+     - booking_audit: recordType="booking_audit", schemaVersion=2, periodKey=YYYY-MM
+
+   Partition strategy:
+     - Each record carries a periodKey (YYYY-MM) derived from its UTC timestamp.
+     - Queries are scoped by addInId + recordType + periodKey where supported.
+     - Additional client-side filtering is applied for fields not supported server-side.
+
+   Serialization rules:
+     - Details payload is a single JSON.stringify at the API boundary.
+     - No double JSON.stringify.
+     - Max 10,000 serialized characters enforced.
+*/
 
 import type {
+  AddInDataAuditData,
+  AddInDataBookingData,
+  AddInDataRecordEnvelope,
+  AddInDataRecordType,
+  AuditAction,
+  BookingDataQuality,
+  BookingValidationResult,
   MyGeotabGroup,
   MyGeotabStatusData,
   MyGeotabLogRecord,
   OpexBooking,
+  OpexBookingAudit,
+  OpexNotification,
+  PeriodKey,
   ResolvedAsset,
   ResolvedBooking,
   ResolvedUser,
   BookingDataProvider,
   NotificationDataProvider,
-  OpexNotification,
-  OpexBookingAudit,
   NotificationType,
 } from "./types";
+import { AddInDataGateway, AddInDataApiError } from "./addinDataService.ts";
 import { isValidAddInId } from "../config/addinId.ts";
 import { validateResolvedBooking } from "./bookingValidation.ts";
 
@@ -30,12 +55,19 @@ type GeotabApi = {
 
 const MAX_DETAILS_CHARS = 10000;
 const DEFAULT_GROUP_ID = "GroupCompanyId";
+const NOTIFICATION_GROUP_ID = DEFAULT_GROUP_ID;
+const AUDIT_GROUP_ID = DEFAULT_GROUP_ID;
+
+function generateBookingId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
 
 type AddInDataDetails = string | Record<string, unknown>;
 
 /*───────────────────── Diagnostic Logging ─────────────────────*/
-/* Safe diagnostic logging for MyGeotab API lifecycle.
-   Never logs session tokens, credentials, AddInId values, or personal data. */
 function diagLog(message: string, detail?: unknown): void {
   try {
     if (typeof console !== "undefined" && console.log) {
@@ -45,34 +77,6 @@ function diagLog(message: string, detail?: unknown): void {
   } catch {
     // Logging must never throw
   }
-}
-const NOTIFICATION_GROUP_ID = DEFAULT_GROUP_ID;
-const AUDIT_GROUP_ID = DEFAULT_GROUP_ID;
-
-function assertDetailsWithinLimit(value: unknown): void {
-  const json = JSON.stringify(value);
-  if (json.length > MAX_DETAILS_CHARS) {
-    throw new Error(`ADDIN_DATA_DETAILS_EXCEEDED: ${json.length} characters (max ${MAX_DETAILS_CHARS})`);
-  }
-}
-
-function toDetailsObject<T extends object>(details: AddInDataDetails): T {
-  return (typeof details === "string" ? JSON.parse(details) : details) as T;
-}
-
-function serializeNotification(n: OpexNotification): OpexNotification {
-  assertDetailsWithinLimit(n);
-  return n;
-}
-function deserializeNotification(details: AddInDataDetails): OpexNotification {
-  return toDetailsObject<OpexNotification>(details);
-}
-function serializeAudit(a: OpexBookingAudit): OpexBookingAudit {
-  assertDetailsWithinLimit(a);
-  return a;
-}
-function deserializeAudit(details: AddInDataDetails): OpexBookingAudit {
-  return toDetailsObject<OpexBookingAudit>(details);
 }
 
 /*───────────────────── Raw MyGeotab record shapes ─────────────────────*/
@@ -130,39 +134,12 @@ function mapLiveAsset(raw: RawMyGeotabDevice): ResolvedAsset {
   };
 }
 
-/*───────────────────── Vehicle name parsing ─────────────────────*/
-/* MyGeotab Add-In device names follow the pattern:
-   "<license_plate>_<make> <model>[_<variant>]"
-
-   Example: "AD 1283 VO_Honda Brio_Andri" → "Honda Brio - Andri"
-   Example: "Toyota Fortuner #01"      → "Toyota Fortuner #01" (no underscore)
-
-   The parsing rule:
-   - Split on "_"
-   - First segment is the license plate prefix (discarded)
-   - Remaining segments form the vehicle name
-   - If 2+ segments remain: join first n-1 with spaces, then " - " + last
-   - If 1 segment remains: use as-is
-   - If no underscore: use the whole name as-is
-   */
 function parseVehicleName(rawName: string): string {
-  if (!rawName || rawName.trim() === "") {
-    return "Unknown Vehicle";
-  }
-
+  if (!rawName || rawName.trim() === "") return "Unknown Vehicle";
   const parts = rawName.split("_");
-  if (parts.length <= 1) {
-    return rawName.trim();
-  }
-
-  // Everything after the first underscore is the vehicle name
+  if (parts.length <= 1) return rawName.trim();
   const nameParts = parts.slice(1);
-
-  if (nameParts.length === 1) {
-    return nameParts[0].trim();
-  }
-
-  // Multiple parts: join all but last with spaces, then " - " + last
+  if (nameParts.length === 1) return nameParts[0].trim();
   const prefix = nameParts.slice(0, -1).join(" ").trim();
   const suffix = nameParts[nameParts.length - 1].trim();
   return `${prefix} - ${suffix}`;
@@ -178,14 +155,10 @@ function mapLiveUser(raw: RawMyGeotabUser): ResolvedUser {
 }
 
 function mapLiveGroup(raw: RawMyGeotabGroup): MyGeotabGroup {
-  return {
-    id: raw.id,
-    name: raw.name,
-    parentId: raw.parentId,
-  };
+  return { id: raw.id, name: raw.name, parentId: raw.parentId };
 }
 
-/*───────────────────── Booking serialization (10,000-char limit) ─────────────────────*/
+/*───────────────────── Booking serialization (single JSON.stringify boundary) ─────────────────────*/
 
 function serializeBooking(booking: OpexBooking): OpexBooking {
   assertDetailsWithinLimit(booking);
@@ -193,7 +166,40 @@ function serializeBooking(booking: OpexBooking): OpexBooking {
 }
 
 function deserializeBooking(details: AddInDataDetails): OpexBooking {
-  return toDetailsObject<OpexBooking>(details);
+  if (typeof details === "string") {
+    try { return JSON.parse(details) as OpexBooking; } catch { return fallbackBooking(); }
+  }
+  return details as unknown as OpexBooking;
+}
+
+function fallbackBooking(): OpexBooking {
+  return {
+    id: "",
+    deviceId: "",
+    requesterUserId: "",
+    requestedClass: "PASSENGER",
+    startAt: "",
+    endAt: "",
+    bufferBeforeMinutes: 0,
+    bufferAfterMinutes: 0,
+    purpose: "",
+    destination: null,
+    passengerCount: null,
+    status: "PENDING_APPROVAL",
+    assignedDriverUserId: null,
+    approverId: null,
+    approvalRemarks: null,
+    createdAt: "",
+    updatedAt: "",
+    version: 0,
+  };
+}
+
+function assertDetailsWithinLimit(value: unknown): void {
+  const json = JSON.stringify(value);
+  if (json.length > MAX_DETAILS_CHARS) {
+    throw new Error(`ADDIN_DATA_DETAILS_EXCEEDED: ${json.length} characters (max ${MAX_DETAILS_CHARS})`);
+  }
 }
 
 /*───────────────────── Conflict check helper ─────────────────────*/
@@ -208,11 +214,13 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   private readonly api: GeotabApi | null;
   private readonly addInId: string | null;
   private readonly groupId: string;
+  private readonly gateway: AddInDataGateway;
 
   constructor(api: GeotabApi | null, addInId: string | null, groupId: string = DEFAULT_GROUP_ID) {
     this.api = api;
     this.addInId = addInId;
     this.groupId = groupId;
+    this.gateway = new AddInDataGateway(api, addInId);
     diagLog("AddInDataBookingDataProvider constructed", {
       hasApi: !!api,
       hasAddInId: !!addInId,
@@ -257,7 +265,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       typeName: "Device",
       resultsLimit: 1000,
     });
-    return devices.map(mapLiveAsset);
+    return (devices ?? []).map(mapLiveAsset);
   }
 
   async getUsers(): Promise<ResolvedUser[]> {
@@ -265,7 +273,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       typeName: "User",
       resultsLimit: 1000,
     });
-    return users.map(mapLiveUser);
+    return (users ?? []).map(mapLiveUser);
   }
 
   async getGroups(): Promise<MyGeotabGroup[]> {
@@ -273,7 +281,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       typeName: "Group",
       resultsLimit: 1000,
     });
-    return groups.map(mapLiveGroup);
+    return (groups ?? []).map(mapLiveGroup);
   }
 
   async getStatusData(): Promise<MyGeotabStatusData[]> {
@@ -306,6 +314,32 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     return (records || []).map(r => resolveAddInDataBooking(r, deviceMap, userMap));
   }
 
+  async getBookingById(bookingId: string): Promise<ResolvedBooking | null> {
+    const records = await this.apiCall<AddInDataRecord[]>("Get", {
+      typeName: "AddInData",
+      search: { addInId: this.addInId },
+    });
+    const devices = await this.getDevicesRaw();
+    const users = await this.getUsersRaw();
+    const deviceMap = new Map(devices.map(d => [d.id, d]));
+    const userMap = new Map(users.map(u => [u.id, u]));
+    for (const record of records || []) {
+      let booking: OpexBooking | null = null;
+      try {
+        if (record.id === bookingId) {
+          booking = deserializeBooking(record.details);
+        } else {
+          const parsed = deserializeBooking(record.details);
+          if (parsed.id === bookingId) booking = parsed;
+        }
+      } catch {
+        // Skip malformed records
+      }
+      if (booking) return resolveAddInDataBookingToResolved(booking, record.id, deviceMap, userMap);
+    }
+    return null;
+  }
+
   async createBooking(input: {
     deviceId: string;
     requesterUserId: string;
@@ -334,7 +368,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
 
     const now = new Date().toISOString();
     const booking: OpexBooking = {
-      id: `addin-${Date.now()}`,
+      id: `addin-${generateBookingId()}`,
       deviceId: input.deviceId,
       requesterUserId: input.requesterUserId,
       requestedClass: input.requestedClass,
@@ -363,12 +397,13 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: this.groupId }],
       },
     });
-    if (response?.id) {
-      booking.id = response.id;
+    const serverRecordId = response?.id ?? "";
+    if (serverRecordId) {
+      booking.id = serverRecordId;
     }
 
     const resolved = await this.getBookings();
-    return resolved.find(b => b.id === booking.id) ?? resolveBookingToResolved(booking);
+    return resolved.find(b => b.id === booking.id) ?? resolveBookingToResolved(booking, serverRecordId);
   }
 
   async updateBookingStatus(id: string, status: string, approverId?: string, approvalRemarks?: string): Promise<void> {
@@ -426,7 +461,6 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
 
   async resetDemoData(): Promise<void> {
     // AddInData mode does not use local demo data. No-op here.
-    // DEMO mode uses LocalBookingDataProvider.resetDemoData().
   }
 
   /*───────────────────── Notification operations (AddInData) ─────────────────────*/
@@ -463,7 +497,6 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     title: string;
     message: string;
   }): Promise<OpexNotification> {
-    // Duplicate prevention: skip if a notification with this idempotency key already exists
     const existing = await this.findByIdempotencyKey(input.idempotencyKey);
     if (existing) return existing;
 
@@ -605,7 +638,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }): Promise<void> {
     const now = new Date().toISOString();
     const record: OpexBookingAudit = {
-      id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      id: `audit-${generateBookingId()}`,
       booking_id: input.booking_id,
       action: input.action,
       actor_user_id: input.actor_user_id,
@@ -632,12 +665,12 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     });
     return (records || [])
       .map(r => deserializeAudit(r.details))
-      .filter(a => a.booking_id === bookingId)
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      .filter(a => a && a.booking_id === bookingId)
+      .sort((a, b) => new Date(b!.created_at).getTime() - new Date(a!.created_at).getTime()) as OpexBookingAudit[];
   }
 
   isLive(): boolean {
-    return true;
+    return this.gateway.isConfigured();
   }
 
   async getApprovers(): Promise<ResolvedUser[]> {
@@ -651,19 +684,48 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }
 }
 
-export {
-  serializeBooking,
-  deserializeBooking,
-  serializeNotification,
-  deserializeNotification,
-  serializeAudit,
-  deserializeAudit,
-  assertDetailsWithinLimit,
-};
+/*───────────────────── Serialization helpers ─────────────────────*/
 
+function serializeNotification(n: OpexNotification): OpexNotification {
+  assertDetailsWithinLimit(n);
+  return n;
+}
 
-export function createAddInDataProvider(api: GeotabApi | null, addInId: string | null): AddInDataBookingDataProvider {
-  return new AddInDataBookingDataProvider(api, addInId);
+function deserializeNotification(details: AddInDataDetails): OpexNotification {
+  if (typeof details === "string") {
+    try { return JSON.parse(details) as OpexNotification; } catch { return fallbackNotification(); }
+  }
+  return details as unknown as OpexNotification;
+}
+
+function fallbackNotification(): OpexNotification {
+  return {
+    id: "",
+    eventId: "",
+    idempotencyKey: "",
+    type: "booking_created",
+    recipient_user_id: "",
+    related_booking_id: null,
+    title: "",
+    message: "",
+    is_read: false,
+    delivery_status: "pending",
+    delivered_at: null,
+    created_at: "",
+    updated_at: "",
+  };
+}
+
+function serializeAudit(a: OpexBookingAudit): OpexBookingAudit {
+  assertDetailsWithinLimit(a);
+  return a;
+}
+
+function deserializeAudit(details: AddInDataDetails): OpexBookingAudit | null {
+  if (typeof details === "string") {
+    try { return JSON.parse(details) as OpexBookingAudit; } catch { return null; }
+  }
+  return details as unknown as OpexBookingAudit | null;
 }
 
 /*───────────────────── Resolve helpers ─────────────────────*/
@@ -736,7 +798,51 @@ function resolveAddInDataBooking(
   };
 }
 
-function resolveBookingToResolved(booking: OpexBooking): ResolvedBooking {
+function resolveAddInDataBookingToResolved(
+  booking: OpexBooking,
+  serverRecordId: string,
+  devices: Map<string, RawMyGeotabDevice>,
+  users: Map<string, RawMyGeotabUser>,
+): ResolvedBooking {
+  const device = devices.get(booking.deviceId ?? undefined);
+  const requester = users.get(booking.requesterUserId ?? undefined);
+  const driver = booking.assignedDriverUserId ? users.get(booking.assignedDriverUserId) : undefined;
+  const validation = validateResolvedBooking({
+    asset_id: booking.deviceId ?? null,
+    requester_id: booking.requesterUserId,
+    status: booking.status ?? "",
+    start_at: booking.startAt,
+    end_at: booking.endAt,
+  });
+  return {
+    id: booking.id,
+    requester_id: booking.requesterUserId,
+    requester_name: requester?.name ?? "Unknown User",
+    requested_class: booking.requestedClass,
+    asset_id: booking.deviceId ?? null,
+    asset_code: device ? `VEH-${device.id.slice(-3).toUpperCase()}` : null,
+    asset_name: device ? parseVehicleName(device.name ?? "") : null,
+    registration_no: device?.licensePlate ?? null,
+    start_at: booking.startAt,
+    end_at: booking.endAt,
+    buffer_before_minutes: booking.bufferBeforeMinutes,
+    buffer_after_minutes: booking.bufferAfterMinutes,
+    purpose: booking.purpose,
+    destination: booking.destination,
+    passenger_count: booking.passengerCount,
+    status: booking.status,
+    approver_id: booking.approverId ?? null,
+    approval_remarks: booking.approvalRemarks ?? null,
+    version: booking.version,
+    created_at: booking.createdAt,
+    updated_at: booking.updatedAt,
+    driver_id: booking.assignedDriverUserId ?? null,
+    driver_name: driver?.name ?? null,
+    dataQuality: validation.quality,
+  };
+}
+
+function resolveBookingToResolved(booking: OpexBooking, serverRecordId?: string): ResolvedBooking {
   const validation = validateResolvedBooking({
     asset_id: booking.deviceId ?? null,
     requester_id: booking.requesterUserId,
@@ -770,4 +876,18 @@ function resolveBookingToResolved(booking: OpexBooking): ResolvedBooking {
     driver_name: null,
     dataQuality: validation.quality,
   };
+}
+
+export {
+  serializeBooking,
+  deserializeBooking,
+  serializeNotification,
+  deserializeNotification,
+  serializeAudit,
+  deserializeAudit,
+  assertDetailsWithinLimit,
+};
+
+export function createAddInDataProvider(api: GeotabApi | null, addInId: string | null): AddInDataBookingDataProvider {
+  return new AddInDataBookingDataProvider(api, addInId);
 }

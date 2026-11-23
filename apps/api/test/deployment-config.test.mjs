@@ -71,7 +71,8 @@ test("environment examples contain placeholders only and keep identity off", () 
   const dev = read("apps/api/.dev.vars.example");
   assert.match(dev, /^IDENTITY_ADAPTER_CONFIGURED=false$/m);
   assert.match(dev, /^GEOTAB_DATABASE=opex_trial$/m);
-  assert.match(dev, /USER:PASSWORD@HOST/);
+  assert.doesNotMatch(dev, /DATABASE_URL/);
+  assert.doesNotMatch(dev, /postgres:\/\//i);
   const web = read("apps/web/.env.example");
   assert.doesNotMatch(web, /^VITE_\w*(SECRET|TOKEN|PASSWORD|KEY)\w*=/im);
   assert.match(web, /^VITE_GEOTAB_DATABASE=opex_trial$/m);

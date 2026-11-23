@@ -11,5 +11,14 @@
       },
       "category": "AddIns"
     }
-  ]
+  ],
+  "files": {
+    "index": "dist/index.html",
+    "assets": "dist/assets/",
+    "serviceAddin": "dist/serviceAddin.js"
+  },
+  "embed": {
+    "supported": true,
+    "note": "Embedded mode requires Geotab Add-In editor configuration with files block. External serviceSrc remains separate."
+  }
 }
