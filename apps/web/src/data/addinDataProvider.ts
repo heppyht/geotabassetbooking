@@ -215,6 +215,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   private readonly addInId: string | null;
   private readonly groupId: string;
   private readonly gateway: AddInDataGateway;
+  private principalCache: Promise<RawMyGeotabUser | null> | null = null;
 
   constructor(api: GeotabApi | null, addInId: string | null, groupId: string = DEFAULT_GROUP_ID) {
     this.api = api;
@@ -258,30 +259,82 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     });
   }
 
-  /*───────────────────── Read-only master data (live from MyGeotab) ─────────────────────*/
+  /*───────────────────── Authenticated principal resolution (MyGeotab Add-In session context) ─────────────────────*/
+
+  private async openSession(): Promise<{ userName: string; database?: string; server?: string } | null> {
+    if (!this.api?.getSession) return null;
+    return new Promise((resolve) => {
+      try {
+        this.api!.getSession!((session) => {
+          resolve(session ? { userName: session.userName ?? "", database: session.database, server: session.server } : null);
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  /**
+   * Resolve the authenticated MyGeotab principal from the live Add-In session.
+   * Performs a targeted User lookup by session userName (permission-compatible);
+   * never enumerates all users. Cached for the lifetime of the provider.
+   */
+  private async ensurePrincipal(): Promise<RawMyGeotabUser | null> {
+    if (this.principalCache !== null) return this.principalCache;
+    this.principalCache = (async () => {
+      const session = await this.openSession();
+      if (!session || !session.userName) return null;
+      const users = await this.apiCall<RawMyGeotabUser[]>("Get", {
+        typeName: "User",
+        search: { name: session.userName },
+        resultsLimit: 10,
+      });
+      const arr = Array.isArray(users) ? users : [];
+      return arr.find((u) => (u.name ?? "").toLowerCase() === session.userName.toLowerCase()) ?? arr[0] ?? null;
+    })();
+    return this.principalCache;
+  }
+
+  /*───────────────────── Read-only master data (live from MyGeotab, permission-compatible) ─────────────────────*/
 
   async getAssets(): Promise<ResolvedAsset[]> {
-    const devices = await this.apiCall<RawMyGeotabDevice[]>("Get", {
-      typeName: "Device",
-      resultsLimit: 1000,
-    });
-    return (devices ?? []).map(mapLiveAsset);
+    const principal = await this.ensurePrincipal();
+    const groupIds = principal ? (principal.companyGroups ?? []) : [];
+    if (groupIds.length === 0) return [];
+    const deviceSets = await Promise.all(
+      groupIds.map((gid) =>
+        this.apiCall<RawMyGeotabDevice[]>("Get", {
+          typeName: "Device",
+          search: { groups: [{ id: gid }] },
+          resultsLimit: 1000,
+        }),
+      ),
+    );
+    const devices = Array.from(new Map(deviceSets.flat().map((d) => [d.id, d] as [string, RawMyGeotabDevice])).values());
+    return devices.map(mapLiveAsset);
   }
 
   async getUsers(): Promise<ResolvedUser[]> {
-    const users = await this.apiCall<RawMyGeotabUser[]>("Get", {
-      typeName: "User",
-      resultsLimit: 1000,
-    });
-    return (users ?? []).map(mapLiveUser);
+    const principal = await this.ensurePrincipal();
+    return principal ? [mapLiveUser(principal)] : [];
   }
 
   async getGroups(): Promise<MyGeotabGroup[]> {
-    const groups = await this.apiCall<RawMyGeotabGroup[]>("Get", {
-      typeName: "Group",
-      resultsLimit: 1000,
-    });
-    return (groups ?? []).map(mapLiveGroup);
+    const principal = await this.ensurePrincipal();
+    const groupIds = principal ? (principal.companyGroups ?? []) : [];
+    if (groupIds.length === 0) return [];
+    const groups = await Promise.all(
+      groupIds.map(async (gid) => {
+        const found = await this.apiCall<RawMyGeotabGroup[]>("Get", {
+          typeName: "Group",
+          search: { id: gid },
+          resultsLimit: 10,
+        });
+        const arr = Array.isArray(found) ? found : [];
+        return arr.length > 0 ? arr[0] : null;
+      }),
+    );
+    return groups.filter((g): g is RawMyGeotabGroup => g !== null).map(mapLiveGroup);
   }
 
   async getStatusData(): Promise<MyGeotabStatusData[]> {
@@ -294,12 +347,44 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
 
   /*───────────────────── Booking transactions (AddInData storage) ─────────────────────*/
 
+  /**
+   * Devices visible to the authenticated principal, scoped to the groups the
+   * principal is verified to belong to (companyGroups). Uses the documented
+   * DeviceSearch `groups: [{ id }]` shape — never an unrestricted Device Get.
+   */
   private async getDevicesRaw(): Promise<RawMyGeotabDevice[]> {
-    return this.apiCall<RawMyGeotabDevice[]>("Get", { typeName: "Device", resultsLimit: 1000 });
+    const principal = await this.ensurePrincipal();
+    const groupIds = principal ? (principal.companyGroups ?? []) : [];
+    if (groupIds.length === 0) return [];
+    const deviceSets = await Promise.all(
+      groupIds.map((gid) =>
+        this.apiCall<RawMyGeotabDevice[]>("Get", {
+          typeName: "Device",
+          search: { groups: [{ id: gid }] },
+          resultsLimit: 1000,
+        }),
+      ),
+    );
+    return Array.from(new Map(deviceSets.flat().map((d) => [d.id, d] as [string, RawMyGeotabDevice])).values());
   }
 
-  private async getUsersRaw(): Promise<RawMyGeotabUser[]> {
-    return this.apiCall<RawMyGeotabUser[]>("Get", { typeName: "User", resultsLimit: 1000 });
+  /**
+   * Resolve only the users actually referenced by the bookings being loaded,
+   * via a targeted UserSearch `userIds` lookup. Never enumerates all users.
+   * Users that cannot be resolved (permission or not found) simply stay absent
+   * from the map, so dependent bookings keep an explicit unresolved-reference
+   * state (dataQuality MISSING_REQUESTER / asset fields null) rather than being
+   * dropped or replaced with demo data.
+   */
+  private async getUsersRaw(userIds: string[]): Promise<RawMyGeotabUser[]> {
+    const distinct = Array.from(new Set(userIds.filter(Boolean)));
+    if (distinct.length === 0) return [];
+    const users = await this.apiCall<RawMyGeotabUser[]>("Get", {
+      typeName: "User",
+      search: { userIds: distinct },
+      resultsLimit: 1000,
+    });
+    return Array.isArray(users) ? users : [];
   }
 
   async getBookings(): Promise<ResolvedBooking[]> {
@@ -308,10 +393,20 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       search: { addInId: this.addInId },
     });
     const devices = await this.getDevicesRaw();
-    const users = await this.getUsersRaw();
-    const deviceMap = new Map(devices.map(d => [d.id, d]));
-    const userMap = new Map(users.map(u => [u.id, u]));
-    return (records || []).map(r => resolveAddInDataBooking(r, deviceMap, userMap));
+    const userIds = new Set<string>();
+    for (const record of records || []) {
+      try {
+        const b = deserializeBooking(record.details);
+        if (b.requesterUserId) userIds.add(b.requesterUserId);
+        if (b.assignedDriverUserId) userIds.add(b.assignedDriverUserId);
+      } catch {
+        // Skip malformed records when collecting references
+      }
+    }
+    const users = await this.getUsersRaw(Array.from(userIds));
+    const deviceMap = new Map(devices.map((d) => [d.id, d]));
+    const userMap = new Map(users.map((u) => [u.id, u]));
+    return (records || []).map((r) => resolveAddInDataBooking(r, deviceMap, userMap));
   }
 
   async getBookingById(bookingId: string): Promise<ResolvedBooking | null> {
@@ -319,10 +414,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       typeName: "AddInData",
       search: { addInId: this.addInId },
     });
-    const devices = await this.getDevicesRaw();
-    const users = await this.getUsersRaw();
-    const deviceMap = new Map(devices.map(d => [d.id, d]));
-    const userMap = new Map(users.map(u => [u.id, u]));
+    let target: { record: AddInDataRecord; booking: OpexBooking } | null = null;
     for (const record of records || []) {
       let booking: OpexBooking | null = null;
       try {
@@ -335,9 +427,20 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       } catch {
         // Skip malformed records
       }
-      if (booking) return resolveAddInDataBookingToResolved(booking, record.id, deviceMap, userMap);
+      if (booking) {
+        target = { record, booking };
+        break;
+      }
     }
-    return null;
+    if (!target) return null;
+    const devices = await this.getDevicesRaw();
+    const userIds = new Set<string>();
+    if (target.booking.requesterUserId) userIds.add(target.booking.requesterUserId);
+    if (target.booking.assignedDriverUserId) userIds.add(target.booking.assignedDriverUserId);
+    const users = await this.getUsersRaw(Array.from(userIds));
+    const deviceMap = new Map(devices.map((d) => [d.id, d]));
+    const userMap = new Map(users.map((u) => [u.id, u]));
+    return resolveAddInDataBookingToResolved(target.booking, target.record.id, deviceMap, userMap);
   }
 
   async createBooking(input: {
@@ -674,13 +777,44 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }
 
   async getApprovers(): Promise<ResolvedUser[]> {
-    const users = await this.apiCall<RawMyGeotabUser[]>("Get", {
-      typeName: "User",
-      resultsLimit: 1000,
-    });
-    return (users || [])
-      .filter(u => u.role === "APPROVER")
-      .map(mapLiveUser);
+    const approvers = new Map<string, RawMyGeotabUser>();
+
+    // 1. The authenticated principal, if they hold the APPROVER role.
+    const principal = await this.ensurePrincipal();
+    if (principal && principal.role === "APPROVER") {
+      approvers.set(principal.id, principal);
+    }
+
+    // 2. Verified approvers taken from actual booking records (distinct approverId values).
+    // Never assume the logged-in principal is the only approver. AddInData Get is scoped by
+    // addInId; no unrestricted User enumeration is performed.
+    if (this.addInId) {
+      const records = await this.apiCall<AddInDataRecord[]>("Get", {
+        typeName: "AddInData",
+        search: { addInId: this.addInId },
+      });
+      const approverIds = new Set<string>();
+      for (const record of records || []) {
+        try {
+          const b = deserializeBooking(record.details);
+          if (b.approverId) approverIds.add(b.approverId);
+        } catch {
+          // Skip malformed records
+        }
+      }
+      if (approverIds.size > 0) {
+        const users = await this.apiCall<RawMyGeotabUser[]>("Get", {
+          typeName: "User",
+          search: { userIds: Array.from(approverIds) },
+          resultsLimit: 1000,
+        });
+        for (const u of Array.isArray(users) ? users : []) {
+          approvers.set(u.id, u);
+        }
+      }
+    }
+
+    return Array.from(approvers.values()).map(mapLiveUser);
   }
 }
 
