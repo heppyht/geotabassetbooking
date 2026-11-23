@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { AddInDataBookingDataProvider } from "../src/data/addinDataProvider.ts";
 
-/* ── Minimal mock that only handles the exact patterns needed ──────────── */
+/* ── Mock API helper ───────────────────────────────────────────────────── */
 
 function makeApi({
   session = { userName: "jdoe@company.com", database: "opex_trial", server: "srv" },
@@ -17,10 +17,15 @@ function makeApi({
     getSession(cb) { cb(session ?? null); },
     call(method, params, success, error) {
       calls.push({ method, params, typeName: params?.typeName });
+      if (method !== "Get") return success(null);
       if (params.typeName === "Device") {
         if (params.search?.groups) {
           const wanted = new Set(params.search.groups.map((g) => g.id));
           return success(devices.filter((d) => (d.groupIds ?? []).some((gid) => wanted.has(gid))));
+        }
+        if (params.search?.userIds) {
+          const wanted = new Set(params.search.userIds);
+          return success(users.filter((u) => wanted.has(u.id)));
         }
         return success(devices);
       }
@@ -53,6 +58,15 @@ function makeProvider({ api, addInId = "aDJjMmVmZWMtYzU1OC00MTJ" } = {}) {
   return new AddInDataBookingDataProvider(api, addInId);
 }
 
+/* ───────────────────────── ensurePrincipal override ───────────────────── */
+
+function overrideEnsurePrincipal(provider, principal) {
+  provider.ensurePrincipal = async () => {
+    provider.principalCache = null;
+    return principal;
+  };
+}
+
 /* ───────────────────────── Core Permission Tests ────────────────────── */
 
 test("getAssets scopes devices to principal's groups via DeviceSearch groups", async () => {
@@ -72,13 +86,12 @@ test("getAssets scopes devices to principal's groups via DeviceSearch groups", a
     ],
   });
   const provider = makeProvider({ api });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: ["grp-hq", "grp-city"],
     role: "APPROVER",
   });
-  provider.principalCache = null;
   const assets = await provider.getAssets();
   const deviceGets = calls.filter(
     (c) => c.method === "Get" && c.typeName === "Device" && c.search?.groups,
@@ -95,30 +108,29 @@ test("getAssets returns [] when principal has no companyGroups", async () => {
     userRecord: { id: "u-1", name: "jdoe@company.com", role: "EMPLOYEE", companyGroups: [] },
   });
   const provider = makeProvider({ api, addInId: null });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: [],
     role: "EMPLOYEE",
   });
-  provider.principalCache = null;
   const assets = await provider.getAssets();
   assert.ok(Array.isArray(assets) && assets.length === 0);
 });
 
 test("getUsers returns only the authenticated principal", async () => {
   const { api, calls } = makeApi({
-    users: [{ id: "u-1", name: "jdoe@company.com", role: "APPROVER", companyGroups: ["grp-hq"] }],
+    users: [{ id: "u-1", name: "jdoe@company.com", role: "APPROVER", companyGroups: ["grp-hq"] },
+            { id: "u-2", name: "jane@company.com", role: "EMPLOYEE", companyGroups: ["grp-hq"] }],
     userRecord: { id: "u-1", name: "jdoe@company.com", role: "APPROVER", companyGroups: ["grp-hq"] },
   });
   const provider = makeProvider({ api });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: ["grp-hq"],
     role: "APPROVER",
   });
-  provider.principalCache = null;
   const users = await provider.getUsers();
   assert.equal(users.length, 1, "getUsers returns exactly one user (the principal)");
   assert.equal(users[0].id, "u-1");
@@ -132,8 +144,7 @@ test("getUsers returns only the authenticated principal", async () => {
 test("getUsers returns [] when not authenticated", async () => {
   const { api } = makeApi({ session: null });
   const provider = makeProvider({ api });
-  provider.ensurePrincipal = async () => null;
-  provider.principalCache = null;
+  overrideEnsurePrincipal(provider, null);
   const users = await provider.getUsers();
   assert.ok(Array.isArray(users) && users.length === 0);
 });
@@ -147,13 +158,12 @@ test("getGroups returns principal's companyGroups with names", async () => {
     ],
   });
   const provider = makeProvider({ api });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: ["grp-hq", "grp-city"],
     role: "APPROVER",
   });
-  provider.principalCache = null;
   const groups = await provider.getGroups();
   assert.equal(groups.length, 2, "getGroups returns 2 groups");
   assert.ok(groups.map((g) => g.name).includes("Head Office"));
@@ -166,13 +176,12 @@ test("getGroups returns [] when principal has no groups", async () => {
     userRecord: { id: "u-1", name: "jdoe@company.com", role: "EMPLOYEE", companyGroups: [] },
   });
   const provider = makeProvider({ api, addInId: null });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: [],
     role: "EMPLOYEE",
   });
-  provider.principalCache = null;
   const groups = await provider.getGroups();
   assert.ok(Array.isArray(groups) && groups.length === 0);
 });
@@ -184,10 +193,10 @@ test("getApprovers includes principal when APPROVER and resolves from booking re
     users: [
       { id: "u-1", name: "jdoe@company.com", role: "APPROVER", companyGroups: ["grp-hq"] },
       { id: "u-2", name: "jane@company.com", role: "EMPLOYEE", companyGroups: ["grp-hq"] },
+      { id: "u-3", name: "bob@company.com", role: "EMPLOYEE", companyGroups: ["grp-hq"] },
     ],
   });
   const provider = makeProvider({ api, addInId: "test-id" });
-  // Mock AddInData search to return booking records with approverIds
   const originalSearch = provider["gateway"].search;
   provider["gateway"].search = async (search) => {
     if (search.typeName === "AddInData" && search.addInId === "test-id") {
@@ -206,7 +215,7 @@ test("getApprovers includes principal when APPROVER and resolves from booking re
 });
 
 test("getBookings scopes devices to groups and resolves users by targeted lookup", async () => {
-  const { api } = makeApi({
+  const { api, calls } = makeApi({
     session: { userName: "jdoe@company.com", database: "opex_trial", server: "srv" },
     userRecord: { id: "u-1", name: "jdoe@company.com", role: "APPROVER", companyGroups: ["grp-hq"] },
     users: [
@@ -247,13 +256,12 @@ test("getBookings scopes devices to groups and resolves users by targeted lookup
     ],
   });
   const provider = makeProvider({ api, addInId: "test-id" });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: ["grp-hq"],
     role: "APPROVER",
   });
-  provider.principalCache = null;
   const bookings = await provider.getBookings();
   assert.equal(bookings.length, 2, "Two bookings loaded");
   const b1 = bookings.find((b) => b.id === "b-1");
@@ -291,13 +299,12 @@ test("getBookings preserves booking with unresolved user reference (dataQuality 
     ],
   });
   const provider = makeProvider({ api, addInId: "test-id" });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: ["grp-hq"],
     role: "APPROVER",
   });
-  provider.principalCache = null;
   const bookings = await provider.getBookings();
   const b1 = bookings.find((b) => b.id === "b-1");
   assert.ok(b1, "Booking preserved despite unresolved user");
@@ -324,13 +331,12 @@ test("getBookingById resolves target booking with scoped devices + targeted user
     ],
   });
   const provider = makeProvider({ api, addInId: "test-id" });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: ["grp-hq"],
     role: "APPROVER",
   });
-  provider.principalCache = null;
   const found = await provider.getBookingById("b-1");
   assert.ok(found, "Booking b-1 found by id");
   assert.equal(found.id, "b-1", "Resolved booking id matches");
@@ -341,13 +347,12 @@ test("getBookingById resolves target booking with scoped devices + targeted user
 test("getBookingById returns null for non-existent booking", async () => {
   const { api } = makeApi({ session: { userName: "jdoe@company.com", database: "opex_trial", server: "srv" } });
   const provider = makeProvider({ api });
-  provider.ensurePrincipal = async () => ({
+  overrideEnsurePrincipal(provider, {
     id: "u-1",
     name: "jdoe@company.com",
     companyGroups: ["grp-hq"],
     role: "APPROVER",
   });
-  provider.principalCache = null;
   const found = await provider.getBookingById("non-existent-id");
   assert.ok(found === null, "getBookingById returns null for non-existent booking");
 });
